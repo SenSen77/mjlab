@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../rl_sar"
+		},
+		{
+			"path": "../robot_lab_v2.2.1"
+		}
+	],
+	"settings": {}
+}

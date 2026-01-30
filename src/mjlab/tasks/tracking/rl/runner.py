@@ -9,6 +9,7 @@ from mjlab.tasks.tracking.rl.exporter import (
   attach_onnx_metadata,
   export_motion_policy_as_onnx,
 )
+from mjlab.utils.lab_api.rl.exporter import export_policy_as_jit
 
 
 class MotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
@@ -35,6 +36,14 @@ class MotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
       normalizer = self.alg.policy.actor_obs_normalizer
     else:
       normalizer = None
+
+    # Export TorchScript policy for deployment (single input -> single output).
+    export_policy_as_jit(
+      self.alg.policy,
+      normalizer,
+      path=policy_path,
+      filename="policy.pt",
+    )
     export_motion_policy_as_onnx(
       self.env.unwrapped,
       self.alg.policy,
@@ -51,6 +60,7 @@ class MotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
       filename=filename,
     )
     if self.logger_type in ["wandb"]:
+      wandb.save(policy_path + "policy.pt", base_path=os.path.dirname(policy_path))
       wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
       # link the artifact registry to this run
       if self.registry_name is not None:

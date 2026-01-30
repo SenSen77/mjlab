@@ -64,6 +64,20 @@ class MotionCommand(CommandTerm):
     super().__init__(cfg, env)
 
     self.robot: Entity = env.scene[cfg.entity_name]
+    # Joint subset used for policy command + joint error metrics.
+    # If empty, default to all robot joints (backwards compatible).
+    if cfg.command_joint_names:
+      cmd_joint_ids, cmd_joint_names = self.robot.find_joints(
+        cfg.command_joint_names, preserve_order=True
+      )
+    else:
+      cmd_joint_names = list(self.robot.joint_names)
+      cmd_joint_ids = list(range(len(cmd_joint_names)))
+    self._command_joint_ids = torch.tensor(
+      cmd_joint_ids, dtype=torch.long, device=self.device
+    )
+    self._command_joint_names = tuple(cmd_joint_names)
+
     self.robot_anchor_body_index = self.robot.body_names.index(
       self.cfg.anchor_body_name
     )
@@ -119,9 +133,35 @@ class MotionCommand(CommandTerm):
     self._ghost_model: mujoco.MjModel | None = None
     self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
 
+  def _command_joint_pos(self) -> torch.Tensor:
+    """Commanded joint positions from motion (aligned to command joint order)."""
+    motion_joint_pos = self.joint_pos
+    if motion_joint_pos.shape[1] == self.robot.num_joints:
+      return motion_joint_pos[:, self._command_joint_ids]
+    if motion_joint_pos.shape[1] == self._command_joint_ids.numel():
+      return motion_joint_pos
+    raise ValueError(
+      "Motion joint_pos dimension does not match robot joints or command_joint_names. "
+      f"Got {motion_joint_pos.shape[1]=}, expected {self.robot.num_joints=} or "
+      f"{self._command_joint_ids.numel()=}."
+    )
+
+  def _command_joint_vel(self) -> torch.Tensor:
+    """Commanded joint velocities from motion (aligned to command joint order)."""
+    motion_joint_vel = self.joint_vel
+    if motion_joint_vel.shape[1] == self.robot.num_joints:
+      return motion_joint_vel[:, self._command_joint_ids]
+    if motion_joint_vel.shape[1] == self._command_joint_ids.numel():
+      return motion_joint_vel
+    raise ValueError(
+      "Motion joint_vel dimension does not match robot joints or command_joint_names. "
+      f"Got {motion_joint_vel.shape[1]=}, expected {self.robot.num_joints=} or "
+      f"{self._command_joint_ids.numel()=}."
+    )
+
   @property
   def command(self) -> torch.Tensor:
-    return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+    return torch.cat([self._command_joint_pos(), self._command_joint_vel()], dim=1)
 
   @property
   def joint_pos(self) -> torch.Tensor:
@@ -237,10 +277,12 @@ class MotionCommand(CommandTerm):
     ).mean(dim=-1)
 
     self.metrics["error_joint_pos"] = torch.norm(
-      self.joint_pos - self.robot_joint_pos, dim=-1
+      self._command_joint_pos() - self.robot_joint_pos[:, self._command_joint_ids],
+      dim=-1,
     )
     self.metrics["error_joint_vel"] = torch.norm(
-      self.joint_vel - self.robot_joint_vel, dim=-1
+      self._command_joint_vel() - self.robot_joint_vel[:, self._command_joint_ids],
+      dim=-1,
     )
 
   def _adaptive_sampling(self, env_ids: torch.Tensor):
@@ -332,19 +374,56 @@ class MotionCommand(CommandTerm):
     root_lin_vel[env_ids] += rand_samples[:, :3]
     root_ang_vel[env_ids] += rand_samples[:, 3:]
 
-    joint_pos = self.joint_pos.clone()
-    joint_vel = self.joint_vel.clone()
+    # Build desired joint state. Motion can contain either:
+    # - full joint state (matches robot.num_joints), or
+    # - commanded joint subset only (matches command_joint_names length).
+    motion_joint_pos = self.joint_pos
+    motion_joint_vel = self.joint_vel
+    if motion_joint_pos.shape[1] == self.robot.num_joints:
+      joint_pos = motion_joint_pos.clone()
+      joint_vel = motion_joint_vel.clone()
+      noise_target_ids = None  # noise all joints
+    elif motion_joint_pos.shape[1] == self._command_joint_ids.numel():
+      joint_pos = self.robot.data.joint_pos.clone()
+      joint_vel = self.robot.data.joint_vel.clone()
+      joint_pos[:, self._command_joint_ids] = motion_joint_pos
+      joint_vel[:, self._command_joint_ids] = motion_joint_vel
+      noise_target_ids = self._command_joint_ids
+    else:
+      raise ValueError(
+        "Motion joint state dimension mismatch. "
+        f"Got {motion_joint_pos.shape[1]=}, expected {self.robot.num_joints=} or "
+        f"{self._command_joint_ids.numel()=}."
+      )
 
-    joint_pos += sample_uniform(
-      lower=self.cfg.joint_position_range[0],
-      upper=self.cfg.joint_position_range[1],
-      size=joint_pos.shape,
-      device=joint_pos.device,  # type: ignore
-    )
+    if noise_target_ids is None:
+      joint_pos += sample_uniform(
+        lower=self.cfg.joint_position_range[0],
+        upper=self.cfg.joint_position_range[1],
+        size=joint_pos.shape,
+        device=joint_pos.device,  # type: ignore
+      )
+    else:
+      joint_pos[env_ids[:, None], noise_target_ids[None, :]] += sample_uniform(
+        lower=self.cfg.joint_position_range[0],
+        upper=self.cfg.joint_position_range[1],
+        size=(len(env_ids), noise_target_ids.numel()),
+        device=joint_pos.device,  # type: ignore
+      )
     soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-    joint_pos[env_ids] = torch.clip(
-      joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
-    )
+    if noise_target_ids is None:
+      joint_pos[env_ids] = torch.clip(
+        joint_pos[env_ids],
+        soft_joint_pos_limits[:, :, 0],
+        soft_joint_pos_limits[:, :, 1],
+      )
+    else:
+      # Only clip commanded subset; leave other joints unchanged.
+      joint_pos[env_ids[:, None], noise_target_ids[None, :]] = torch.clip(
+        joint_pos[env_ids[:, None], noise_target_ids[None, :]],
+        soft_joint_pos_limits[:, noise_target_ids, 0],
+        soft_joint_pos_limits[:, noise_target_ids, 1],
+      )
     self.robot.write_joint_state_to_sim(
       joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids
     )
@@ -419,7 +498,21 @@ class MotionCommand(CommandTerm):
         qpos = np.zeros(self._env.sim.mj_model.nq)
         qpos[free_joint_q_adr[0:3]] = self.body_pos_w[batch, 0].cpu().numpy()
         qpos[free_joint_q_adr[3:7]] = self.body_quat_w[batch, 0].cpu().numpy()
-        qpos[joint_q_adr] = self.joint_pos[batch].cpu().numpy()
+        motion_joint_pos = self.joint_pos
+        if motion_joint_pos.shape[1] == entity.num_joints:
+          desired_joint_pos = motion_joint_pos[batch].cpu().numpy()
+        elif motion_joint_pos.shape[1] == self._command_joint_ids.numel():
+          desired_joint_pos = entity.data.joint_pos[batch].cpu().numpy().copy()
+          desired_joint_pos[self._command_joint_ids.cpu().numpy()] = (
+            motion_joint_pos[batch].cpu().numpy()
+          )
+        else:
+          raise ValueError(
+            "Motion joint_pos dimension mismatch for visualization. "
+            f"Got {motion_joint_pos.shape[1]=}, expected {entity.num_joints=} or "
+            f"{self._command_joint_ids.numel()=}."
+          )
+        qpos[joint_q_adr] = desired_joint_pos
 
         visualizer.add_ghost_mesh(qpos, model=self._ghost_model, label=f"ghost_{batch}")
 
@@ -476,6 +569,7 @@ class MotionCommandCfg(CommandTermCfg):
   anchor_body_name: str
   body_names: tuple[str, ...]
   entity_name: str
+  command_joint_names: tuple[str, ...] = field(default_factory=tuple)
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.52, 0.52)
