@@ -2,7 +2,7 @@
 
 import pytest
 
-from mjlab.asset_zoo.robots import G1_ACTION_SCALE, GO1_ACTION_SCALE
+from mjlab.asset_zoo.robots import G1_23_ACTION_SCALE, G1_ACTION_SCALE, GO1_ACTION_SCALE
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
@@ -159,7 +159,7 @@ def test_rough_velocity_play_has_curriculum_disabled() -> None:
 
 
 def test_g1_velocity_has_correct_action_scale(g1_velocity_task_ids: list[str]) -> None:
-    """G1 velocity tasks should use G1_ACTION_SCALE."""
+    """G1 velocity tasks should use the correct per-model action scale."""
     for task_id in g1_velocity_task_ids:
         cfg = load_env_cfg(task_id)
 
@@ -170,9 +170,10 @@ def test_g1_velocity_has_correct_action_scale(g1_velocity_task_ids: list[str]) -
             joint_pos_action, JointPositionActionCfg
         ), f"Task {task_id} joint_pos action is not JointPositionActionCfg"
 
+        expected_scale = G1_23_ACTION_SCALE if "23DoF" in task_id else G1_ACTION_SCALE
         assert (
-            joint_pos_action.scale == G1_ACTION_SCALE
-        ), f"Task {task_id} action scale mismatch, expected G1_ACTION_SCALE"
+            joint_pos_action.scale == expected_scale
+        ), f"Task {task_id} action scale mismatch"
 
 
 def test_go1_velocity_has_correct_action_scale(

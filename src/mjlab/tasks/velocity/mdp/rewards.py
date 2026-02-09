@@ -179,6 +179,31 @@ def feet_clearance(
     return cost
 
 
+def feet_clearance_bodies(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    command_name: str | None = None,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Body-based variant of :func:`feet_clearance` (uses body-link z/vel)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_z = asset.data.body_link_pos_w[:, asset_cfg.body_ids, 2]  # [B, N]
+    foot_vel_xy = asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids, :2]  # [B, N, 2]
+    vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
+    delta = torch.abs(foot_z - target_height)  # [B, N]
+    cost = torch.sum(delta * vel_norm, dim=1)  # [B]
+    if command_name is not None:
+        command = env.command_manager.get_command(command_name)
+        if command is not None:
+            linear_norm = torch.norm(command[:, :2], dim=1)
+            angular_norm = torch.abs(command[:, 2])
+            total_command = linear_norm + angular_norm
+            active = (total_command > command_threshold).float()
+            cost = cost * active
+    return cost
+
+
 class feet_swing_height:
     """Penalize deviation from target swing height, evaluated at landing."""
 
@@ -231,6 +256,62 @@ class feet_swing_height:
         return cost
 
 
+class feet_swing_height_bodies:
+    """Body-based variant of :class:`feet_swing_height` (tracks body-link z peaks)."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        self.sensor_name = cfg.params["sensor_name"]
+        self.body_names = cfg.params["asset_cfg"].body_names
+        self.peak_heights = torch.zeros(
+            (env.num_envs, len(self.body_names)), device=env.device, dtype=torch.float32
+        )
+        self.step_dt = env.step_dt
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        target_height: float,
+        command_name: str,
+        command_threshold: float,
+        asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        asset: Entity = env.scene[asset_cfg.name]
+        contact_sensor: ContactSensor = env.scene[sensor_name]
+        command = env.command_manager.get_command(command_name)
+        assert command is not None
+
+        foot_heights = asset.data.body_link_pos_w[:, asset_cfg.body_ids, 2]
+        in_air = contact_sensor.data.found == 0
+        self.peak_heights = torch.where(
+            in_air,
+            torch.maximum(self.peak_heights, foot_heights),
+            self.peak_heights,
+        )
+
+        first_contact = contact_sensor.compute_first_contact(dt=self.step_dt)
+        linear_norm = torch.norm(command[:, :2], dim=1)
+        angular_norm = torch.abs(command[:, 2])
+        total_command = linear_norm + angular_norm
+        active = (total_command > command_threshold).float()
+        error = self.peak_heights / target_height - 1.0
+        cost = torch.sum(torch.square(error) * first_contact.float(), dim=1) * active
+
+        num_landings = torch.sum(first_contact.float())
+        peak_heights_at_landing = self.peak_heights * first_contact.float()
+        mean_peak_height = torch.sum(peak_heights_at_landing) / torch.clamp(
+            num_landings, min=1
+        )
+        env.extras["log"]["Metrics/peak_height_mean"] = mean_peak_height
+
+        self.peak_heights = torch.where(
+            first_contact,
+            torch.zeros_like(self.peak_heights),
+            self.peak_heights,
+        )
+        return cost
+
+
 def feet_slip(
     env: ManagerBasedRlEnv,
     sensor_name: str,
@@ -250,6 +331,36 @@ def feet_slip(
     assert contact_sensor.data.found is not None
     in_contact = (contact_sensor.data.found > 0).float()  # [B, N]
     foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, N, 2]
+    vel_xy_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
+    vel_xy_norm_sq = torch.square(vel_xy_norm)  # [B, N]
+    cost = torch.sum(vel_xy_norm_sq * in_contact, dim=1) * active
+    num_in_contact = torch.sum(in_contact)
+    mean_slip_vel = torch.sum(vel_xy_norm * in_contact) / torch.clamp(
+        num_in_contact, min=1
+    )
+    env.extras["log"]["Metrics/slip_velocity_mean"] = mean_slip_vel
+    return cost
+
+
+def feet_slip_bodies(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str,
+    command_threshold: float = 0.01,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Body-based variant of :func:`feet_slip` (uses body-link xy velocity)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene[sensor_name]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    linear_norm = torch.norm(command[:, :2], dim=1)
+    angular_norm = torch.abs(command[:, 2])
+    total_command = linear_norm + angular_norm
+    active = (total_command > command_threshold).float()
+    assert contact_sensor.data.found is not None
+    in_contact = (contact_sensor.data.found > 0).float()  # [B, N]
+    foot_vel_xy = asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids, :2]  # [B, N, 2]
     vel_xy_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
     vel_xy_norm_sq = torch.square(vel_xy_norm)  # [B, N]
     cost = torch.sum(vel_xy_norm_sq * in_contact, dim=1) * active

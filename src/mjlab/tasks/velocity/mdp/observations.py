@@ -21,6 +21,19 @@ def foot_height(
     return asset.data.site_pos_w[:, asset_cfg.site_ids, 2]  # (num_envs, num_sites)
 
 
+def body_height(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+    """Body-link height (z) in world frame.
+
+    Site-free alternative for assets that don't define foot sites.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    return asset.data.body_link_pos_w[
+        :, asset_cfg.body_ids, 2
+    ]  # (num_envs, num_bodies)
+
+
 def foot_air_time(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
     sensor: ContactSensor = env.scene[sensor_name]
     sensor_data = sensor.data
